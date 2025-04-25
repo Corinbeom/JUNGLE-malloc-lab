@@ -39,7 +39,6 @@ team_t team = {
 #define WSIZE 4  //  워드 크기. 헤더나 푸터 한 개의 크기. 보통 4바이트 (32비트)
 #define DSIZE 8  //  더블 워드 크기. 페이로드 정렬을 위해 최소 블록 크기로 사용. 보통 8바이트 (밑에 ALIGN과 관련이 있는지 알아볼 것)
 #define CHUNKSIZE (1 << 12)  //  초기 힙 확장 단위. 힙을 확장할 때 한 번에 이만큼 요청. 일반적으로 4096 바이트 (4KB)
-#define MINBLOCKSIZE (2 * DSIZE)
 
 
 #define MAX(x, y) ((x) > (y) ? (x) : (y))
@@ -70,77 +69,43 @@ team_t team = {
 
 void *heap_listp;
 
-// void mm_checkheap(int verbose) {
-//     char *bp = heap_listp;
-//
-//     if (verbose)
-//         printf("Heap (%p):\n", heap_listp);
-//
-//     // Prologue 체크
-//     if (GET_SIZE(HDRP(bp)) != DSIZE || !GET_ALLOC(HDRP(bp)))
-//         printf("Bad prologue header\n");
-//
-//     // 블록 전체 순회
-//     for (bp = heap_listp; GET_SIZE(HDRP(bp)) > 0; bp = NEXT_BLKP(bp)) {
-//         if (verbose)
-//             printf("Block at %p, size %u, alloc %u\n",
-//                    bp, GET_SIZE(HDRP(bp)), GET_ALLOC(HDRP(bp)));
-//
-//         // 8바이트 정렬 체크
-//         if ((size_t)bp % 8)
-//             printf("Error: %p is not 8-byte aligned\n", bp);
-//
-//         // 블록 크기 0 이상인지 확인
-//         if (GET_SIZE(HDRP(bp)) == 0)
-//             printf("Error: block at %p has size 0\n", bp);
-//
-//         // Free block은 header/footer 일치해야 함
-//         if (!GET_ALLOC(HDRP(bp))) {
-//             if (GET(HDRP(bp)) != GET(FTRP(bp)))
-//                 printf("Error: header/footer mismatch at %p\n", bp);
-//         }
-//     }
-//
-//     // Epilogue 체크
-//     if (GET_SIZE(HDRP(bp)) != 0 || !GET_ALLOC(HDRP(bp)))
-//         printf("Bad epilogue header\n");
-// }
-
-
-
-
 static void *coalesce(void *bp)
 {
-    size_t prev_alloc = GET_ALLOC(FTRP(PREV_BLKP(bp)));
-    size_t next_alloc = GET_ALLOC(HDRP(NEXT_BLKP(bp)));
-    size_t size = GET_SIZE(HDRP(bp));
+    size_t prev_alloc = GET_ALLOC(FTRP(PREV_BLKP(bp)));  //  이전 블록 할당 여부
+    size_t next_alloc = GET_ALLOC(HDRP(NEXT_BLKP(bp)));  //  다음 블록 할당 여부
+    size_t size = GET_SIZE(HDRP(bp));  //  전체 블록 크기
+
+    //  case 1 : 이전/다음 모두 할당 된 경우 => 병합 불가
     if (prev_alloc && next_alloc)
     {
         return bp;
     }
 
+    // case 2 : 다음 블록만 free => 다음 블록과 병합
     else if (prev_alloc && !next_alloc)
     {
-        size += GET_SIZE(HDRP(NEXT_BLKP(bp)));
-        PUT(HDRP(bp), PACK(size, 0));
-        PUT(FTRP(bp), PACK(size, 0));
+        size += GET_SIZE(HDRP(NEXT_BLKP(bp)));  //  크기 확장
+        PUT(HDRP(bp), PACK(size, 0));           //  header 갱신
+        PUT(FTRP(bp), PACK(size, 0));           //  footer 갱신
         return bp;
     }
 
+    // case 3 : 이전 블록만 free => 이전 블록과 병합
     else if (!prev_alloc && next_alloc)
     {
-        size += GET_SIZE(HDRP(PREV_BLKP(bp)));
-        PUT(FTRP(bp), PACK(size, 0));
-        PUT(HDRP(PREV_BLKP(bp)), PACK(size, 0));
-        bp = PREV_BLKP(bp);
+        size += GET_SIZE(HDRP(PREV_BLKP(bp)));      //  크기 확장
+        PUT(FTRP(bp), PACK(size, 0));               //  footer 갱신 (현재 블록 기준)
+        PUT(HDRP(PREV_BLKP(bp)), PACK(size, 0));    //  이전 블록의 header 갱신
+        bp = PREV_BLKP(bp);         //  병합 후 위치 이동
     }
 
+    // case 4 : 이전/다음 모두 free => 세 개 병합
     else
     {
-        size += GET_SIZE(HDRP(PREV_BLKP(bp))) + GET_SIZE(FTRP(NEXT_BLKP(bp)));
-        PUT(HDRP(PREV_BLKP(bp)), PACK(size, 0));
-        PUT(FTRP(NEXT_BLKP(bp)), PACK(size, 0));
-        bp = PREV_BLKP(bp);
+        size += GET_SIZE(HDRP(PREV_BLKP(bp))) + GET_SIZE(FTRP(NEXT_BLKP(bp)));  // 크기 확장 (이전 + 다음 블록과 병합
+        PUT(HDRP(PREV_BLKP(bp)), PACK(size, 0));    //  header : 이전 블록 기준
+        PUT(FTRP(NEXT_BLKP(bp)), PACK(size, 0));    //  footer : 다음 블록 기준
+        bp = PREV_BLKP(bp);             //  병합된 블록의 시작 위치로 이동
     }
     return bp;
 }
@@ -190,28 +155,39 @@ int mm_init(void)
  * mm_malloc - Allocate a block by incrementing the brk pointer.
  *     Always allocate a block whose size is a multiple of the alignment.
  */
+
+// 적절한 free block을 찾는 first-fit 함수
 static void *find_fit(size_t asize)
 {
     void *bp = heap_listp;
+
+    // 현재 블록이 할당중이거나, 크기가 부족하면 계속 탐색
     while (GET_ALLOC(HDRP(bp)) || GET_SIZE(HDRP(bp)) < asize)
     {
+        // epilogue 까지 도달한 경우, 더 이상 블록 없음
         if (GET_SIZE(HDRP(bp)) == 0)
         {
             return NULL;
         }
-        bp = NEXT_BLKP(bp);
+        bp = NEXT_BLKP(bp);  // 다음 블록으로 이동 (curr = curr->next 이거랑 비슷한느낌)
     }
 
-    return bp;
+    return bp;  // 적절한 free 블록을 찾으면 bp 리턴
 }
 
+// 주어진 위치에 메모리를 배치 (필요 시 분할)
 void place(void *bp, size_t asize)
 {
-    size_t block_size = GET_SIZE(HDRP(bp));
+    size_t block_size = GET_SIZE(HDRP(bp));  // 현재 블록 전체 크기
+
+    // 현재 블록을 asize 크기로 할당 표시
     PUT(HDRP(bp), PACK(asize, 1));
     PUT(FTRP(bp), PACK(asize, 1));
+
+    // 남는 공간이 있을 경우, 새로운 free 블록으로 분할
     if (block_size > asize)
     {
+        // 다음 블록의 header/footer를 free 상태로 초기화
         PUT(HDRP(NEXT_BLKP(bp)), PACK(block_size - asize, 0));
         PUT(FTRP(NEXT_BLKP(bp)), PACK(block_size - asize, 0));
     }
