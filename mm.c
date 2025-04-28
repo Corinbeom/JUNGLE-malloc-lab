@@ -1,30 +1,24 @@
+// 🧹 malloc-lab 최종 수정 버전 (분리 가용 리스트 + first fit)
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
-
+#include <stdbool.h>
 #include "mm.h"
 #include "memlib.h"
 
+team_t team = {
+    "ateam", "Harry Bovik", "bovik@cs.cmu.edu", "", ""
+};
+
 #define WSIZE 4
 #define DSIZE 8
-#define CHUNKSIZE (1 << 12)
-
-team_t team = {
-    /* Team name */
-    "ateam",
-    /* First member's full name */
-    "Harry Bovik",
-    /* First member's email address */
-    "bovik@cs.cmu.edu",
-    /* Second member's full name (leave blank if none) */
-    "",
-    /* Second member's email address (leave blank if none) */
-    ""
-};
+#define CHUNKSIZE (1 << 12) // 4096 bytes
 
 #define MAX(x, y) ((x) > (y) ? (x) : (y))
 #define PACK(size, alloc) ((size) | (alloc))
+
 #define GET(p) (*(unsigned int *)(p))
 #define PUT(p, val) (*(unsigned int *)(p) = (val))
 
@@ -39,45 +33,51 @@ team_t team = {
 #define PRED(bp) (*(void **)(bp))
 #define SUCC(bp) (*(void **)((char *)(bp) + WSIZE))
 
-#define ALIGNMENT 8
-#define ALIGN(size) (((size) + (ALIGNMENT-1)) & ~0x7)
+#define NUM_CLASSES 8
 
 static char *heap_listp = NULL;
-static void *free_listp = NULL;
-static void *last_bp = NULL;
+static void *segregated_free_lists[NUM_CLASSES];
 
-//////////////////////////////////////////////////////////
+// find size class
+static int find_size_class(size_t size) {
+    if (size <= 16) return 0;
+    else if (size <= 32) return 1;
+    else if (size <= 64) return 2;
+    else if (size <= 128) return 3;
+    else if (size <= 256) return 4;
+    else if (size <= 512) return 5;
+    else if (size <= 1024) return 6;
+    else return 7;
+}
 
-// insert at head
+// insert node
 static void insert_node(void *bp) {
-    if (!bp) return;
-    SUCC(bp) = free_listp;
+    int class_idx = find_size_class(GET_SIZE(HDRP(bp)));
+
+    SUCC(bp) = segregated_free_lists[class_idx];
     PRED(bp) = NULL;
-    if (free_listp) {
-        PRED(free_listp) = bp;
-    }
-    free_listp = bp;
+    if (segregated_free_lists[class_idx] != NULL)
+        PRED(segregated_free_lists[class_idx]) = bp;
+    segregated_free_lists[class_idx] = bp;
 }
 
 // remove node
 static void remove_node(void *bp) {
-    if (!bp) return;
-    if (PRED(bp)) {
+    int class_idx = find_size_class(GET_SIZE(HDRP(bp)));
+
+    if (PRED(bp))
         SUCC(PRED(bp)) = SUCC(bp);
-    } else {
-        free_listp = SUCC(bp);
-    }
-    if (SUCC(bp)) {
+    else
+        segregated_free_lists[class_idx] = SUCC(bp);
+
+    if (SUCC(bp))
         PRED(SUCC(bp)) = PRED(bp);
-    }
-    PRED(bp) = NULL;
-    SUCC(bp) = NULL;
 }
 
 // coalesce
 static void *coalesce(void *bp) {
-    size_t prev_alloc = (HDRP(PREV_BLKP(bp)) < (char *)mem_heap_lo()) ? 1 : GET_ALLOC(FTRP(PREV_BLKP(bp)));
-    size_t next_alloc = (HDRP(NEXT_BLKP(bp)) > (char *)mem_heap_hi()) ? 1 : GET_ALLOC(HDRP(NEXT_BLKP(bp)));
+    bool prev_alloc = (PREV_BLKP(bp) < (void *)mem_heap_lo()) || GET_ALLOC(HDRP(PREV_BLKP(bp)));
+    bool next_alloc = (NEXT_BLKP(bp) > (void *)mem_heap_hi()) || GET_ALLOC(HDRP(NEXT_BLKP(bp)));
     size_t size = GET_SIZE(HDRP(bp));
 
     if (prev_alloc && next_alloc) {
@@ -85,69 +85,55 @@ static void *coalesce(void *bp) {
         return bp;
     }
     else if (prev_alloc && !next_alloc) {
-        void *next = NEXT_BLKP(bp);
-        remove_node(next);
-        size += GET_SIZE(HDRP(next));
+        remove_node(NEXT_BLKP(bp));
+        size += GET_SIZE(HDRP(NEXT_BLKP(bp)));
         PUT(HDRP(bp), PACK(size, 0));
         PUT(FTRP(bp), PACK(size, 0));
-        insert_node(bp);
     }
     else if (!prev_alloc && next_alloc) {
-        void *prev = PREV_BLKP(bp);
-        remove_node(prev);
-        size += GET_SIZE(HDRP(prev));
+        remove_node(PREV_BLKP(bp));
+        size += GET_SIZE(HDRP(PREV_BLKP(bp)));
+        PUT(HDRP(PREV_BLKP(bp)), PACK(size, 0));
         PUT(FTRP(bp), PACK(size, 0));
-        PUT(HDRP(prev), PACK(size, 0));
-        bp = prev;
-        insert_node(bp);
+        bp = PREV_BLKP(bp);
     }
     else {
-        void *prev = PREV_BLKP(bp);
-        void *next = NEXT_BLKP(bp);
-        remove_node(prev);
-        remove_node(next);
-        size += GET_SIZE(HDRP(prev)) + GET_SIZE(FTRP(next));
-        PUT(HDRP(prev), PACK(size, 0));
-        PUT(FTRP(next), PACK(size, 0));
-        bp = prev;
-        insert_node(bp);
+        remove_node(PREV_BLKP(bp));
+        remove_node(NEXT_BLKP(bp));
+        size += GET_SIZE(HDRP(PREV_BLKP(bp))) + GET_SIZE(HDRP(NEXT_BLKP(bp)));
+        PUT(HDRP(PREV_BLKP(bp)), PACK(size, 0));
+        PUT(FTRP(NEXT_BLKP(bp)), PACK(size, 0));
+        bp = PREV_BLKP(bp);
     }
-
+    insert_node(bp);
     return bp;
 }
 
-// extend_heap
+// extend heap
 static void *extend_heap(size_t words) {
-    char *bp;
     size_t size = (words % 2) ? (words + 1) * WSIZE : words * WSIZE;
+    void *bp;
 
-    if ((long)(bp = mem_sbrk(size)) == -1) return NULL;
+    if ((long)(bp = mem_sbrk(size)) == -1)
+        return NULL;
 
-    PUT(HDRP(bp), PACK(size, 0));            // Free block header
-    PUT(FTRP(bp), PACK(size, 0));            // Free block footer
-    PUT(HDRP(NEXT_BLKP(bp)), PACK(0, 1));    // New epilogue header
+    PUT(HDRP(bp), PACK(size, 0));
+    PUT(FTRP(bp), PACK(size, 0));
+    PUT(HDRP(NEXT_BLKP(bp)), PACK(0, 1));
 
     return coalesce(bp);
 }
 
-// find_fit (next fit)
+// find fit
 static void *find_fit(size_t asize) {
-    void *bp = last_bp ? last_bp : free_listp;
-
-    if (bp == NULL) return NULL;
-    void *start_bp = bp;
-
-    do {
-        if (!GET_ALLOC(HDRP(bp)) && GET_SIZE(HDRP(bp)) >= asize) {
-            last_bp = bp;
-            return bp;
+    for (int i = find_size_class(asize); i < NUM_CLASSES; i++) {
+        void *bp = segregated_free_lists[i];
+        while (bp != NULL) {
+            if (GET_SIZE(HDRP(bp)) >= asize)
+                return bp;
+            bp = SUCC(bp);
         }
-        bp = SUCC(bp);
-        if (bp == NULL) {
-            bp = free_listp;
-        }
-    } while (bp != start_bp && bp != NULL);
-
+    }
     return NULL;
 }
 
@@ -159,33 +145,37 @@ static void place(void *bp, size_t asize) {
     if ((csize - asize) >= (2 * DSIZE)) {
         PUT(HDRP(bp), PACK(asize, 1));
         PUT(FTRP(bp), PACK(asize, 1));
+
         void *next_bp = NEXT_BLKP(bp);
         PUT(HDRP(next_bp), PACK(csize - asize, 0));
         PUT(FTRP(next_bp), PACK(csize - asize, 0));
         insert_node(next_bp);
-    } else {
+    }
+    else {
         PUT(HDRP(bp), PACK(csize, 1));
         PUT(FTRP(bp), PACK(csize, 1));
     }
-
-    last_bp = NULL;  // next_fit 신뢰성 위해
 }
 
 //////////////////////////////////////////////////////////
 
 // mm_init
 int mm_init(void) {
-    if ((heap_listp = mem_sbrk(4 * WSIZE)) == (void *)-1) return -1;
-    PUT(heap_listp, 0);                            // Alignment padding
-    PUT(heap_listp + (1 * WSIZE), PACK(DSIZE, 1));  // Prologue header
-    PUT(heap_listp + (2 * WSIZE), PACK(DSIZE, 1));  // Prologue footer
-    PUT(heap_listp + (3 * WSIZE), PACK(0, 1));      // Epilogue header
+    if ((heap_listp = mem_sbrk(4 * WSIZE)) == (void *)-1)
+        return -1;
+
+    PUT(heap_listp, 0);
+    PUT(heap_listp + (1 * WSIZE), PACK(DSIZE, 1));
+    PUT(heap_listp + (2 * WSIZE), PACK(DSIZE, 1));
+    PUT(heap_listp + (3 * WSIZE), PACK(0, 1));
     heap_listp += (2 * WSIZE);
 
-    free_listp = NULL;
-    last_bp = NULL;
+    for (int i = 0; i < NUM_CLASSES; i++)
+        segregated_free_lists[i] = NULL;
 
-    if (extend_heap(CHUNKSIZE / WSIZE) == NULL) return -1;
+    if (extend_heap(CHUNKSIZE/WSIZE) == NULL)
+        return -1;
+
     return 0;
 }
 
@@ -195,11 +185,13 @@ void *mm_malloc(size_t size) {
     size_t extendsize;
     char *bp;
 
-    if (size == 0) return NULL;
+    if (size == 0)
+        return NULL;
+
     if (size <= DSIZE)
         asize = 2 * DSIZE;
     else
-        asize = DSIZE * ((size + (DSIZE) + (DSIZE - 1)) / DSIZE);
+        asize = DSIZE * ((size + (DSIZE) + (DSIZE-1)) / DSIZE);
 
     if ((bp = find_fit(asize)) != NULL) {
         place(bp, asize);
@@ -207,14 +199,18 @@ void *mm_malloc(size_t size) {
     }
 
     extendsize = MAX(asize, CHUNKSIZE);
-    if ((bp = extend_heap(extendsize / WSIZE)) == NULL) return NULL;
+    if ((bp = extend_heap(extendsize/WSIZE)) == NULL)
+        return NULL;
+
     place(bp, asize);
     return bp;
 }
 
 // mm_free
 void mm_free(void *bp) {
-    if (!bp) return;
+    if (bp == NULL)
+        return;
+
     size_t size = GET_SIZE(HDRP(bp));
     PUT(HDRP(bp), PACK(size, 0));
     PUT(FTRP(bp), PACK(size, 0));
@@ -223,18 +219,36 @@ void mm_free(void *bp) {
 
 // mm_realloc
 void *mm_realloc(void *ptr, size_t size) {
-    if (ptr == NULL) return mm_malloc(size);
+    if (ptr == NULL)
+        return mm_malloc(size);  // ptr이 NULL이면 malloc과 같은 방식으로 처리
     if (size == 0) {
-        mm_free(ptr);
+        mm_free(ptr);  // size가 0이면 해당 블록을 free하고 NULL 반환
         return NULL;
     }
 
-    void *newptr = mm_malloc(size);
-    if (newptr == NULL) return NULL;
+    size_t oldsize = GET_SIZE(HDRP(ptr));  // 기존 블록의 크기 가져오기
+    size_t asize = (size <= DSIZE) ? (2 * DSIZE) : DSIZE * ((size + (DSIZE) + (DSIZE-1)) / DSIZE);
 
-    size_t oldsize = GET_SIZE(HDRP(ptr)) - DSIZE;
-    if (size < oldsize) oldsize = size;
-    memcpy(newptr, ptr, oldsize);
-    mm_free(ptr);
-    return newptr;
+    if (asize <= oldsize)
+        return ptr;  // 기존 크기가 충분하면 기존 포인터 그대로 반환
+
+    void *next = NEXT_BLKP(ptr);  // 다음 블록 주소
+    if (!GET_ALLOC(HDRP(next)) && (oldsize + GET_SIZE(HDRP(next))) >= asize) {
+        remove_node(next);  // 만약 옆 블록이 free이고 크기가 충분하면 병합
+        size_t newsize = oldsize + GET_SIZE(HDRP(next));  // 병합 후 새로운 크기
+        PUT(HDRP(ptr), PACK(newsize, 1));  // 헤더 업데이트
+        PUT(FTRP(ptr), PACK(newsize, 1));  // 푸터 업데이트
+        return ptr;  // 병합된 블록 반환
+    }
+
+    void *newptr = mm_malloc(size);  // 병합할 수 없다면 새로운 메모리 할당
+    if (newptr == NULL)
+        return NULL;  // 할당 실패하면 NULL 반환
+
+    size_t copySize = oldsize - DSIZE;  // 기존 데이터 크기
+    if (size < copySize)
+        copySize = size;  // 복사할 크기를 요청된 크기로 맞춤
+    memcpy(newptr, ptr, copySize);  // 데이터 복사
+    mm_free(ptr);  // 기존 블록은 free
+    return newptr;  // 새로운 포인터 반환
 }
